@@ -1062,7 +1062,9 @@ def serve(room: Room, port: int, host: str, open_browser: bool = True):
             ui_version = str(int((web / "index.html").stat().st_mtime))
         except OSError:
             ui_version = "0"
-        return {"cwd": room.s["cwd"], "chat": str(room.chat), "n": room.n, "entries": ents, "ui_version": ui_version,
+        home = str(Path.home())
+        cwd_display = ("~" + room.s["cwd"][len(home):]) if room.s["cwd"].startswith(home) else room.s["cwd"]
+        return {"cwd": room.s["cwd"], "cwd_display": cwd_display, "chat": str(room.chat), "n": room.n, "entries": ents, "ui_version": ui_version,
                 "title": room.title,
                 "archives": room.archives(), "steps": step_counts(room.path / "turns"),
                 "live": ([{**e, "text": e["text"][:500]} for e in room.agents[l["busy"]].events[-80:]] if l["busy"] else []),
