@@ -1,0 +1,1341 @@
+#!/usr/bin/env python3
+"""duet: one shared conversation between you, Claude Code and Codex.
+
+Run `duet` in a project directory. It opens the room for that directory (.duet/chat.md, created
+on first use) and drops you into a prompt. Every time an analyst takes a turn it is handed the
+entire log as context and its reply is appended, so both analysts always see exactly the same
+conversation. You direct work to either of them (@claude, @codex) or to both. Nothing is held in
+hidden per-agent sessions; the log on disk is the whole state and you can edit it between turns.
+
+Both CLIs run with API-key environment variables stripped so they bill to the logged-in
+subscriptions (claude.ai / ChatGPT), never to API keys.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from string import Template
+
+HERE = Path(__file__).resolve().parent
+PROMPTS = HERE / "prompts"
+ROOM_DIR = ".duet"
+GLOBAL_DIR = Path.home() / ".duet"
+PERSONA_FILE = "personalization.md"
+
+DISPLAY = {"claude": "Claude", "codex": "Codex", "human": "Human"}
+OTHER = {"claude": "codex", "codex": "claude"}
+AGENTS = ("claude", "codex")
+WRITE_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+STRIP_ENV = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+STATUS_RE = re.compile(r"^\s*\**STATUS\**\s*:\s*\**\s*(WAITING|CONTINUE)\b", re.I | re.M)
+ENTRY_RE = re.compile(r"^### \[(?P<n>\d+)\] (?P<who>Human|Claude|Codex)(?P<addr>.*)$", re.M)
+FAKE = os.environ.get("DUET_FAKE") == "1"
+
+
+class AgentError(RuntimeError):
+    pass
+
+
+def child_env(keep_keys: bool) -> dict:
+    env = dict(os.environ)
+    for k in STRIP_ENV:
+        if keep_keys and k.endswith("_API_KEY"):
+            continue
+        env.pop(k, None)
+    # A headless turn ends when the agent replies; nothing can deliver background results after that.
+    # Keep delegation in the foreground so subagents finish inside the turn.
+    env.setdefault("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
+    env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
+    return env
+
+
+def now() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def hr(title: str = "", ch: str = "─") -> str:
+    return f"{ch * 4} {title} {ch * max(4, 72 - len(title))}" if title else ch * 78
+
+
+def render(name: str, **kw) -> str:
+    return Template((PROMPTS / f"{name}.md").read_text()).safe_substitute(kw).strip() + "\n"
+
+
+def personalization(room_path: Path) -> dict:
+    """Standing instructions from the human: global (every room) and per project. Read fresh each turn."""
+    out = {}
+    for scope, f in (("global", GLOBAL_DIR / PERSONA_FILE), ("project", room_path / PERSONA_FILE)):
+        try:
+            out[scope] = f.read_text().strip()
+        except OSError:
+            out[scope] = ""
+    return out
+
+
+def save_personalization(room_path: Path, scope: str, text: str):
+    f = (GLOBAL_DIR if scope == "global" else room_path) / PERSONA_FILE
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text.strip() + ("\n" if text.strip() else ""))
+
+
+UNTITLED = "duet room"
+TITLE_RE = re.compile(r"^# (.*)$", re.M)
+
+
+def title_of(text: str) -> str | None:
+    m = TITLE_RE.search(text)
+    t = m.group(1).strip() if m else ""
+    return None if not t or t == UNTITLED else t
+
+
+def name_conversation(context: str) -> str | None:
+    """Ask Claude (haiku, no tools) for a short title. None on any failure."""
+    if FAKE:
+        return " ".join(context.split()[:5]).rstrip(".,:;") or None
+    prompt = ("Give this conversation a title of 3 to 6 words, like a document name: specific to the subject matter, "
+              "no quotes, no trailing period, Title Case. Output only the title.\n\n<conversation>\n"
+              + context[:6000] + "\n</conversation>")
+    try:
+        p = subprocess.run(["claude", "-p", "--model", "haiku", "--restricted", "--no-session-persistence",
+                            "--output-format", "json", "--permission-prompts", "none", "--disallowedTools", "*"],
+                           input=prompt, text=True, capture_output=True, timeout=60, env=child_env(False))
+        data = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}
+        t = (data.get("result") or "").strip().strip('"').splitlines()[0].strip() if not data.get("is_error") else ""
+        return t[:80] or None
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        return None
+
+
+# --------------------------------------------------------------------------- permission tool
+
+def permission_server(url: str):
+    """Stdio MCP server with one tool, `permission`, that Claude Code calls when an action needs
+    approval. Each call is forwarded to the duet web server, which shows it in the UI and waits
+    for the human. Protocol: newline-delimited JSON-RPC 2.0."""
+    import urllib.request
+
+    def http(path: str, body: dict | None = None, timeout: float = 30) -> dict:
+        req = urllib.request.Request(url + path, data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"}, method="POST" if body is not None else "GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+
+    def decide(args: dict) -> dict:
+        tool, inp = args.get("tool_name") or "tool", args.get("input") or {}
+        try:
+            rid = http("/api/permission/request", {"tool_name": tool, "input": inp,
+                                                   "summary": tool_summary(tool, inp)})["id"]
+            deadline = time.time() + 30 * 60
+            while time.time() < deadline:
+                r = http(f"/api/permission/wait?id={rid}", timeout=40)
+                if r.get("decided"):
+                    if r.get("allow"):
+                        return {"behavior": "allow", "updatedInput": inp}
+                    return {"behavior": "deny", "message": r.get("message") or "The human declined this action."}
+            return {"behavior": "deny", "message": "No answer from the human within 30 minutes."}
+        except Exception as e:  # server gone, aborted turn, etc.
+            return {"behavior": "deny", "message": f"Permission could not be requested: {e}"}
+
+    out = sys.stdout
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        if method == "initialize":
+            res = {"protocolVersion": params.get("protocolVersion") or "2025-06-18",
+                   "capabilities": {"tools": {}}, "serverInfo": {"name": "duet", "version": "1"}}
+        elif method == "tools/list":
+            res = {"tools": [{"name": "permission", "description": "Ask the human in duet to allow or deny a tool use.",
+                              "inputSchema": {"type": "object", "properties": {
+                                  "tool_name": {"type": "string"}, "input": {"type": "object"},
+                                  "tool_use_id": {"type": "string"}}, "required": ["tool_name", "input"]}}]}
+        elif method == "tools/call":
+            res = {"content": [{"type": "text", "text": json.dumps(decide(params.get("arguments") or {}))}]}
+        elif method == "ping":
+            res = {}
+        elif mid is None:
+            continue   # notification
+        else:
+            out.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "unknown method"}}) + "\n")
+            out.flush()
+            continue
+        out.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": res}) + "\n")
+        out.flush()
+
+
+# --------------------------------------------------------------------------- models
+
+CLAUDE_MODELS = [
+    {"id": "fable", "name": "Fable 5.1", "desc": "most capable", "efforts": []},
+    {"id": "opus", "name": "Opus 5.5", "desc": "", "efforts": []},
+    {"id": "sonnet", "name": "Sonnet 5.5", "desc": "", "efforts": []},
+    {"id": "haiku", "name": "Haiku 4.5", "desc": "fastest", "efforts": []},
+]
+
+
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+
+def claude_settings() -> dict:
+    try:
+        return json.load(open(Path.home() / ".claude" / "settings.json"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def claude_default() -> str:
+    return claude_settings().get("model") or "claude.ai default"
+
+
+def codex_default() -> str:
+    try:
+        for line in open(Path.home() / ".codex" / "config.toml"):
+            m = re.match(r'\s*model\s*=\s*"([^"]+)"', line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return "codex default"
+
+
+def codex_models(timeout: float = 20) -> list[dict]:
+    """Ask `codex app-server` (JSON-RPC over stdio) for its model catalog. [] if anything fails."""
+    import threading
+    try:
+        proc = subprocess.Popen(["codex", "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, env=child_env(False))
+    except FileNotFoundError:
+        return []
+    ready, done, result = threading.Event(), threading.Event(), {}
+
+    def reader():
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("id") == 1:
+                ready.set()
+            elif ev.get("id") == 2:
+                result.update(ev.get("result") or {})
+                done.set()
+                break
+    threading.Thread(target=reader, daemon=True).start()
+
+    def send(obj):
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": "duet", "title": "duet", "version": "0.1"}, "capabilities": {}}})
+        if ready.wait(timeout):
+            send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            send({"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": {}})
+            done.wait(timeout)
+    except (OSError, ValueError):
+        pass
+    finally:
+        proc.kill()
+    out = []
+    for m in result.get("data") or []:
+        if m.get("hidden"):
+            continue
+        out.append({"id": m.get("id") or m.get("model"), "name": m.get("displayName") or m.get("id"),
+                    "desc": m.get("description") or "",
+                    "efforts": [e.get("reasoningEffort") for e in m.get("supportedReasoningEfforts") or [] if e.get("reasoningEffort")],
+                    "default_effort": m.get("defaultReasoningEffort"), "is_default": bool(m.get("isDefault"))})
+    return out
+
+
+# --------------------------------------------------------------------------- agents
+
+def tool_summary(name: str, inp) -> str:
+    """One-line description of a Claude tool call for the activity log."""
+    if not isinstance(inp, dict):
+        return str(inp)[:300]
+    if name == "Bash":
+        return inp.get("command") or inp.get("description") or ""
+    if name in ("Read", "Write", "NotebookEdit"):
+        return inp.get("file_path") or inp.get("notebook_path") or ""
+    if name in ("Edit", "MultiEdit"):
+        out = inp.get("file_path") or ""
+        if inp.get("old_string") is not None:
+            out += f"\n- {str(inp.get('old_string'))[:200]}\n+ {str(inp.get('new_string'))[:200]}"
+        return out
+    if name == "Grep":
+        return f"{inp.get('pattern', '')}  {inp.get('path') or inp.get('glob') or ''}".strip()
+    if name == "Glob":
+        return inp.get("pattern") or ""
+    if name == "WebSearch":
+        return inp.get("query") or ""
+    if name == "WebFetch":
+        return inp.get("url") or ""
+    if name in ("Agent", "Task"):
+        return inp.get("description") or str(inp.get("prompt", ""))[:200]
+    return json.dumps(inp)[:300]
+
+
+def result_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return "" if content is None else str(content)
+
+
+SHELL_WRAP = re.compile(r"^/bin/\w+ -lc (.*)$", re.S)
+
+
+def unwrap_shell(cmd: str) -> str:
+    m = SHELL_WRAP.match(cmd or "")
+    if not m:
+        return cmd or ""
+    inner = m.group(1).strip()
+    if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in "\"'":
+        inner = inner[1:-1]
+    return inner
+
+
+class Agent:
+    def __init__(self, kind: str, cwd: Path, model: str | None, yolo: bool, extra_allow: list[str],
+                 timeout: int, keep_keys: bool):
+        self.kind, self.cwd, self.model, self.yolo = kind, cwd, model, yolo
+        self.extra_allow, self.timeout, self.keep_keys = extra_allow, timeout, keep_keys
+        self.effort: str | None = None   # claude --effort / codex model_reasoning_effort
+        self.permissions = "ask"         # ask | auto | off  (claude only; codex has its sandbox)
+        self.permission_url: str | None = None   # set by the web server; needed for "ask"
+        self.turns = 0
+        self.cost_usd = 0.0      # Claude's list-price estimate; informational on a subscription
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.events: list[dict] = []   # activity of the turn in progress (or the last one)
+        self.on_event = None
+        self.proc: subprocess.Popen | None = None
+
+    def state(self) -> dict:
+        return {k: getattr(self, k) for k in ("kind", "model", "effort", "yolo", "extra_allow", "timeout", "keep_keys",
+                                              "turns", "cost_usd", "input_tokens", "output_tokens", "permissions")}
+
+    @classmethod
+    def from_state(cls, d: dict, cwd: Path) -> "Agent":
+        a = cls(d["kind"], cwd, d.get("model"), d.get("yolo", False), d.get("extra_allow") or [],
+                d.get("timeout", 7200), d.get("keep_keys", False))
+        for k in ("turns", "cost_usd", "input_tokens", "output_tokens"):
+            setattr(a, k, d.get(k, 0))
+        a.effort = d.get("effort")
+        a.permissions = d.get("permissions") or "ask"
+        return a
+
+    @property
+    def display(self) -> str:
+        return DISPLAY[self.kind]
+
+    # activity ---------------------------------------------------------------------
+    def emit(self, k: str, text: str, name: str = "", sub: bool = False):
+        """k: think | tool | out | text. name: tool name, or 'error' for a failed result. sub: from a subagent."""
+        ev = {"k": k, "name": name or "", "text": (text or "")[:6000], "t": round(time.time(), 2)}
+        if sub:
+            ev["sub"] = True
+        self.events.append(ev)
+        if self.on_event:
+            self.on_event(ev)
+
+    def abort(self):
+        self._abort = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+
+    # one turn ---------------------------------------------------------------------
+    def send(self, prompt: str, write: bool, logbase: Path, on_event=None) -> dict:
+        logbase.parent.mkdir(parents=True, exist_ok=True)
+        logbase.with_suffix(".prompt.md").write_text(prompt)
+        self.events, self.on_event = [], on_event
+        t0 = time.time()
+        try:
+            if FAKE:
+                out = self._fake(prompt)
+            elif self.kind == "claude":
+                out = self._claude(prompt, write, logbase)
+            else:
+                out = self._codex(prompt, write, logbase)
+        finally:
+            self.on_event = None
+        out["elapsed"] = time.time() - t0
+        self.turns += 1
+        text = out["text"].strip()
+        if not text:
+            raise AgentError(f"{self.display} returned an empty message; see {logbase}.stderr.txt")
+        # the final message is shown as the reply, not as a step
+        if self.events and self.events[-1]["k"] == "text" and self.events[-1]["text"].strip() == text:
+            self.events.pop()
+        out["steps"] = len(self.events)
+        return out
+
+    def _fake(self, prompt: str) -> dict:
+        d = float(os.environ.get("DUET_FAKE_DELAY", "0")) / 3
+        self._abort = False
+
+        def nap():
+            end = time.time() + d
+            while time.time() < end:
+                if self._abort:
+                    raise AgentError(f"{self.display} turn aborted")
+                time.sleep(0.1)
+        self.emit("think", "Fake reasoning: deciding what to read first."); nap()
+        self.emit("tool", "python3 model.py", "Bash"); nap()
+        self.emit("out", "Y1 3.2\nY2 4.4\nY3 5.5\n"); nap()
+        return {"text": f"[fake {self.display} reply #{self.turns + 1}; prompt {len(prompt)} chars]"}
+
+    def _run(self, args: list[str], prompt: str, logbase: Path, on_line) -> subprocess.CompletedProcess:
+        import threading
+        logbase.with_suffix(".cmd.txt").write_text(" ".join(repr(a) if " " in a else a for a in args) + "\n")
+        try:
+            proc = subprocess.Popen(args, cwd=str(self.cwd), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, env=child_env(self.keep_keys))
+        except FileNotFoundError:
+            raise AgentError(f"{args[0]!r} not found on PATH") from None
+        self.proc = proc
+        err_chunks, timed_out = [], []
+
+        def feed():
+            try:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+        t_err = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()), daemon=True)
+        t_err.start()
+        timer = threading.Timer(self.timeout, lambda: (timed_out.append(1), proc.kill()))
+        timer.start()
+        out_lines = []
+        try:
+            for line in proc.stdout:
+                out_lines.append(line)
+                try:
+                    on_line(line)
+                except Exception as e:  # a parse bug must not kill the turn
+                    print(f"  [event parse error: {e}]", file=sys.stderr)
+            proc.wait()
+        except BaseException:
+            proc.kill()
+            raise
+        finally:
+            timer.cancel()
+            t_err.join(timeout=5)
+            self.proc = None
+        out, err = "".join(out_lines), "".join(err_chunks)
+        logbase.with_suffix(".stdout.txt").write_text(out)
+        logbase.with_suffix(".stderr.txt").write_text(err)
+        if timed_out:
+            raise AgentError(f"{self.display} timed out after {self.timeout}s")
+        if proc.returncode == -9:
+            raise AgentError(f"{self.display} turn aborted")
+        return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+    def _claude(self, prompt: str, write: bool, logbase: Path) -> dict:
+        args = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"]
+        if self.model:
+            args += ["--model", self.model]
+        if self.effort:
+            args += ["--effort", self.effort]
+        policy = self.permissions if self.permission_url or self.permissions != "ask" else "auto"
+        if write and (self.yolo or policy == "off"):
+            args += ["--permission-mode", "bypassPermissions"]
+        else:
+            args += ["--permission-mode", "auto"]
+            if not write:
+                args += ["--disallowedTools", *WRITE_TOOLS]
+        if policy == "ask" and self.permission_url:
+            cfg = {"mcpServers": {"duet": {"command": sys.executable, "args": [str(Path(__file__).resolve())],
+                                           "env": {"DUET_PERMISSION_URL": self.permission_url}}}}
+            args += ["--permission-prompt-tool", "mcp__duet__permission", "--mcp-config", json.dumps(cfg)]
+        else:
+            args += ["--permission-prompts", "none"]
+        if self.extra_allow:
+            args += ["--allowedTools", *self.extra_allow]
+        final = {}
+
+        def on_line(line: str):
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            t = ev.get("type")
+            sub = bool(ev.get("parent_tool_use_id"))
+            if t == "assistant":
+                for b in (ev.get("message") or {}).get("content") or []:
+                    bt = b.get("type")
+                    if bt == "thinking" and b.get("thinking"):
+                        self.emit("think", b["thinking"], sub=sub)
+                    elif bt == "tool_use":
+                        self.emit("tool", tool_summary(b.get("name"), b.get("input")), b.get("name") or "tool", sub=sub)
+                    elif bt == "text" and b.get("text") and not sub:
+                        self.emit("text", b["text"])
+            elif t == "user":
+                for b in (ev.get("message") or {}).get("content") or []:
+                    if b.get("type") == "tool_result":
+                        self.emit("out", result_text(b.get("content")), "error" if b.get("is_error") else "", sub=sub)
+            elif t == "result":
+                final.update(ev)
+        p = self._run(args, prompt, logbase, on_line)
+        if not final:
+            raise AgentError(f"claude exited {p.returncode} without a result; see {logbase}.stderr.txt")
+        if final.get("is_error"):
+            raise AgentError(f"claude error: {str(final.get('result'))[:500]}")
+        self.cost_usd += float(final.get("total_cost_usd") or 0)
+        u = final.get("usage") or {}
+        self.input_tokens += sum(int(u.get(k, 0)) for k in
+                                 ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        self.output_tokens += int(u.get("output_tokens", 0))
+        denials = [d.get("tool_name") for d in final.get("permission_denials") or []]
+        return {"text": final.get("result") or "", "denials": denials}
+
+    def _codex(self, prompt: str, write: bool, logbase: Path) -> dict:
+        last = logbase.with_suffix(".last.md")
+        args = ["codex", "exec", "--json", "--ephemeral", "--skip-git-repo-check", "-o", str(last),
+                "-c", 'approval_policy="never"', "-c", 'model_reasoning_summary="auto"']
+        if write and self.yolo:
+            args += ["--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            args += ["-c", f'sandbox_mode="{"workspace-write" if write else "read-only"}"']
+        if self.model:
+            args += ["-m", self.model]
+        if self.effort:
+            args += ["-c", f'model_reasoning_effort="{self.effort}"']
+        args.append("-")
+        messages, errors = [], []
+
+        def on_line(line: str):
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            t = ev.get("type")
+            it = ev.get("item") or {}
+            ty = it.get("type")
+            if t == "item.started" and ty == "command_execution":
+                self.emit("tool", unwrap_shell(it.get("command")), "shell")
+            elif t == "item.completed":
+                if ty == "command_execution":
+                    rc = it.get("exit_code")
+                    self.emit("out", it.get("aggregated_output") or "", "error" if rc not in (0, None) else "")
+                elif ty == "reasoning" and it.get("text"):
+                    self.emit("think", it["text"])
+                elif ty == "agent_message":
+                    messages.append(it.get("text") or "")
+                    if it.get("text"):
+                        self.emit("text", it["text"])
+                elif ty == "file_change":
+                    self.emit("tool", "\n".join(f"{c.get('kind')} {c.get('path')}" for c in it.get("changes") or []), "edit")
+                elif ty == "web_search" and it.get("query"):
+                    self.emit("tool", it["query"], "search")
+                elif ty == "mcp_tool_call":
+                    self.emit("tool", json.dumps(it.get("arguments") or "")[:300], it.get("tool") or "mcp")
+            elif t == "turn.completed":
+                u = ev.get("usage") or {}
+                self.input_tokens += int(u.get("input_tokens", 0))
+                self.output_tokens += int(u.get("output_tokens", 0))
+            elif t in ("error", "turn.failed"):
+                errors.append(json.dumps(ev)[:500])
+        p = self._run(args, prompt, logbase, on_line)
+        if p.returncode != 0 and not messages:
+            raise AgentError(f"codex exited {p.returncode}: {(errors or [p.stderr[-500:]])[0]}")
+        text = last.read_text() if last.exists() else ""
+        if not text.strip() and messages:
+            text = messages[-1]
+        return {"text": text, "errors": errors}
+
+
+def parse_entries(text: str) -> list[dict]:
+    ms = list(ENTRY_RE.finditer(text))
+    out = []
+    for i, m in enumerate(ms):
+        end = ms[i + 1].start() if i + 1 < len(ms) else len(text)
+        out.append({"n": int(m.group("n")), "who": m.group("who"), "addr": m.group("addr").strip(),
+                    "text": text[m.end():end].strip()})
+    return out
+
+
+# --------------------------------------------------------------------------- room
+
+class Room:
+    def __init__(self, path: Path, state: dict):
+        import threading
+        self.path, self.s = path, state
+        self.agents = {k: Agent.from_state(v, Path(state["cwd"])) for k, v in state["agents"].items()}
+        self.lock = threading.RLock()
+
+    # title: the first line of chat.md ----------------------------------------------
+    @property
+    def title(self) -> str:
+        t = title_of(self.log_text())
+        if t:
+            return t
+        first = next((e["text"] for e in self.entries() if e["who"] == "Human"), "")
+        return first.strip().splitlines()[0][:80] if first else "New conversation"
+
+    def set_title(self, title: str):
+        title = " ".join(title.split())[:80]
+        with self.lock:
+            text = self.log_text()
+            new = TITLE_RE.sub(lambda m: f"# {title}", text, count=1) if TITLE_RE.search(text) else f"# {title}\n{text}"
+            self.chat.write_text(new)
+        print(f"  [titled: {title}]", flush=True)
+
+    _naming = False
+
+    def ensure_title(self):
+        """Name the conversation in the background if it has content but no title yet."""
+        import threading
+        if self._naming or title_of(self.log_text()):
+            return
+        ents = self.entries()
+        if not ents:
+            return
+        human = [e["text"] for e in ents if e["who"] == "Human"]
+        replies = [f"{e['who']}: {e['text'][:1200]}" for e in ents if e["who"] != "Human"][:2]
+        context = "Brief: " + human[0][:3000] + "\n\n" + "\n\n".join(replies)
+        self._naming = True
+
+        def work():
+            try:
+                t = name_conversation(context)
+                if t and not title_of(self.log_text()):
+                    self.set_title(t)
+                elif not t:
+                    print("  [could not name the conversation; will retry after the next turn]", flush=True)
+            finally:
+                self._naming = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def auto_title(self, brief: str):
+        self.ensure_title()
+
+    @classmethod
+    def open(cls, cwd: Path, agents: dict[str, Agent], read_only: bool, commit: bool, first: str) -> "Room":
+        path = cwd / ROOM_DIR
+        if (path / "state.json").exists():
+            room = cls(path, json.loads((path / "state.json").read_text()))
+            room.s["read_only"], room.s["commit"], room.s["first"] = read_only, commit, first
+            for k, a in agents.items():            # fresh flags (yolo...), keep counters and chosen model
+                for c in ("turns", "cost_usd", "input_tokens", "output_tokens"):
+                    setattr(a, c, getattr(room.agents[k], c))
+                if a.model is None:
+                    a.model = room.agents[k].model
+                a.effort = room.agents[k].effort
+                a.permissions = room.agents[k].permissions
+            room.agents = agents
+            room.save()
+            return room
+        path.mkdir(parents=True, exist_ok=True)
+        state = {"cwd": str(cwd), "created": now(), "n": 0, "first": first, "read_only": read_only,
+                 "commit": commit, "agents": {k: a.state() for k, a in agents.items()}}
+        room = cls(path, state)
+        room.agents = agents
+        room.chat.write_text(f"# duet room\n\nworking directory: `{cwd}`\n")
+        room.save()
+        return room
+
+    def archive(self) -> Path:
+        """Move the current log aside and start an empty one."""
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = self.path / f"chat-{stamp}.md"
+        self.chat.rename(dest)
+        turns = self.path / "turns"
+        if turns.exists():
+            turns.rename(self.path / f"turns-{stamp}")
+        self.s["n"] = 0
+        self.chat.write_text(f"# duet room\n\nworking directory: `{self.cwd}`\n")
+        self.save()
+        return dest
+
+    def save(self):
+        self.s["agents"] = {k: a.state() for k, a in self.agents.items()}
+        self.s["updated"] = now()
+        (self.path / "state.json").write_text(json.dumps(self.s, indent=2))
+
+    # the log --------------------------------------------------------------------
+    @property
+    def chat(self) -> Path:
+        return self.path / "chat.md"
+
+    def log_text(self) -> str:
+        return self.chat.read_text()
+
+    def entries(self) -> list[dict]:
+        return parse_entries(self.log_text())
+
+    def archives(self) -> list[dict]:
+        out = []
+        for f in sorted(self.path.glob("chat-*.md"), reverse=True):
+            text = f.read_text()
+            ents = parse_entries(text)
+            first = next((e["text"] for e in ents if e["who"] == "Human"), "")
+            out.append({"name": f.name, "entries": len(ents),
+                        "title": title_of(text) or (first.strip().splitlines()[0][:80] if first else "(empty)"),
+                        "when": dt.datetime.fromtimestamp(f.stat().st_mtime).isoformat(timespec="minutes")})
+        return out
+
+    @property
+    def n(self) -> int:
+        ms = ENTRY_RE.findall(self.log_text())
+        return int(ms[-1][0]) if ms else 0
+
+    def append(self, who: str, text: str, addr: str) -> int:
+        with self.lock:
+            n = self.n + 1
+            self.s["n"] = n
+            with self.chat.open("a") as f:
+                f.write(f"\n### [{n}] {DISPLAY[who]}{addr}\n\n{text.strip()}\n")
+        if who == "human" and n == 1:
+            self.auto_title(text)
+        return n
+
+    @property
+    def cwd(self) -> Path:
+        return Path(self.s["cwd"])
+
+    @property
+    def can_write(self) -> bool:
+        return not self.s["read_only"]
+
+    # one analyst turn --------------------------------------------------------------
+    def turn(self, kind: str, instruction: str, quiet: bool, log_snapshot: str | None = None) -> str:
+        agent = self.agents[kind]
+        n = self.n + 1
+        pz = personalization(self.path)
+        standing = "\n\n".join(t for t in (pz["global"], pz["project"]) if t)
+        prompt = (render("system", self_=agent.display, other=DISPLAY[OTHER[kind]], cwd=self.s["cwd"],
+                         writes="may" if self.can_write else "may not",
+                         standing=("\n## Standing instructions from the human\n\nThese apply to every turn and take precedence over the defaults above.\n\n" + standing + "\n") if standing else "")
+                  + "\n# The conversation so far\n\n" + (log_snapshot if log_snapshot is not None else self.log_text())
+                  + f"\n\n# Your turn, {agent.display}\n\n" + instruction)
+        print(f"\n{hr(f'[{n}] {agent.display}')}\n  waiting on {agent.display}…", flush=True)
+        label = f"{n:03d}-{kind}"
+        evfile = self.path / "turns" / f"{label}.events.jsonl"
+        evfile.parent.mkdir(parents=True, exist_ok=True)
+        evfile.write_text("")
+
+        def on_event(ev):
+            with evfile.open("a") as f:
+                f.write(json.dumps(ev) + "\n")
+            if not quiet and ev["k"] in ("tool", "think"):
+                first = ev["text"].strip().splitlines()[0][:110] if ev["text"].strip() else ""
+                print(f"  ▸ {ev['name'] or ev['k']}: {first}", flush=True)
+        out = agent.send(prompt, write=self.can_write, logbase=self.path / "turns" / label, on_event=on_event)
+        evfile.write_text("".join(json.dumps(e) + "\n" for e in agent.events))   # final reply is not a step
+        text = out["text"].strip()
+        self.append(kind, text, "")
+        if not quiet:
+            print(text, flush=True)
+        extra = f"  [{out['elapsed']:.0f}s, {out.get('steps', 0)} steps"
+        if out.get("denials"):
+            extra += f", denied tools: {', '.join(map(str, out['denials']))}"
+        if out.get("errors"):
+            extra += f", codex errors: {len(out['errors'])}"
+        print(extra + "]", flush=True)
+        if self.can_write and self.s["commit"]:
+            self.git_commit(f"duet: [{self.s['n']}] {agent.display}")
+        self.save()
+        self.ensure_title()
+        return text
+
+    def git_commit(self, msg: str):
+        if not (self.cwd / ".git").exists():
+            return
+        subprocess.run(["git", "add", "-A"], cwd=self.cwd, capture_output=True)
+        r = subprocess.run(["git", "commit", "-qm", msg], cwd=self.cwd, capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"  [committed: {msg}]", flush=True)
+
+    # human actions ------------------------------------------------------------------
+    def say(self, text: str, to: list[str], quiet: bool, tag: str = ""):
+        addr = ("" if len(to) == 2 else f" → {DISPLAY[to[0]]}") + tag
+        self.append("human", text, addr)
+        self.save()
+        for kind in to:
+            self.turn(kind, render("reply", self_=DISPLAY[kind], other=DISPLAY[OTHER[kind]],
+                                   addressed="you" if len(to) == 1 else "both of you"), quiet)
+
+    def note(self, text: str):
+        self.append("human", text, " (note, no reply needed)")
+        self.save()
+
+    def ask(self, text: str, quiet: bool, tag: str = ""):
+        """Both answer without seeing each other's answer, then both answers land in the log."""
+        self.append("human", text, " (independent answers)" + tag)
+        self.save()
+        snapshot = self.log_text()
+        for kind in self.order():
+            self.turn(kind, render("ask", self_=DISPLAY[kind], other=DISPLAY[OTHER[kind]]), quiet, log_snapshot=snapshot)
+
+    def go(self, n: int, quiet: bool):
+        """The analysts work with each other for up to n turns; either can hand back with STATUS: WAITING."""
+        kinds = self.order()
+        last = self.last_speaker()
+        kind = OTHER[last] if last in AGENTS else kinds[0]
+        for _ in range(n):
+            text = self.turn(kind, render("go", self_=DISPLAY[kind], other=DISPLAY[OTHER[kind]]), quiet)
+            m = STATUS_RE.findall(text)
+            if m and m[-1].upper() == "WAITING":
+                print(f"  [{DISPLAY[kind]} is waiting on you]")
+                return
+            kind = OTHER[kind]
+
+    def order(self) -> tuple[str, str]:
+        f = self.s["first"]
+        return (f, OTHER[f])
+
+    def last_speaker(self) -> str:
+        m = ENTRY_RE.findall(self.log_text())
+        return {v: k for k, v in DISPLAY.items()}[m[-1][1]] if m else "human"
+
+    def status(self) -> str:
+        log = self.log_text()
+        lines = [f"{self.title}\n{self.chat}  entries={self.n}  "
+                 f"log≈{len(log) // 4} tokens  writes={'on' if self.can_write else 'off'}  "
+                 f"commit={'on' if self.s['commit'] else 'off'}"]
+        for a in self.agents.values():
+            line = (f"  {a.display:7s} model={a.model or 'default'} turns={a.turns} "
+                    f"in_tokens={a.input_tokens} out_tokens={a.output_tokens}")
+            if a.kind == "claude":
+                line += f" list_price_estimate=${a.cost_usd:.2f} (subscription; informational)"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- repl
+
+HELP = """\
+  <text>            to both analysts; each replies in turn (the second sees the first's reply)
+  @claude <text>    task or question for Claude only
+  @codex <text>     task or question for Codex only
+  /ask <text>       both answer independently, without seeing each other's answer, then both land in the log
+  /go [N]           let them work with each other for N turns (default 2); either can stop with STATUS: WAITING
+  /note <text>      add to the log without asking for a reply (context, data, decisions)
+  /writes on|off    whether analysts may change files here
+  /model claude|codex <name>   switch a model for this room (claude: fable, opus, sonnet, haiku; codex: see /models); /model shows
+  /models           list the models each CLI offers
+  /persona          show the standing instructions in effect and where to edit them
+  /title [text]     show or set this conversation's title (set automatically from the brief)
+  /effort claude|codex <level>   reasoning effort (claude: low..max; codex: low..ultra; or default); /effort shows
+  /new              archive this conversation and start a fresh one in this directory
+  /status  /log  /help  /quit
+Ctrl-C during a turn aborts that turn only. Ctrl-D quits. The log is plain markdown; edit it between turns."""
+
+
+def repl(room: Room, quiet: bool):
+    try:
+        import readline  # noqa: F401
+    except ImportError:
+        pass
+    room.ensure_title()
+    print(f"{hr('duet')}\n{room.status()}")
+    if room.n == 0:
+        print("\nempty room. whatever you type first is the brief; both analysts will answer it.  /help for commands")
+    else:
+        print("\n/help for commands")
+    while True:
+        try:
+            line = input("\nyou> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            line = "/quit"
+        if not line:
+            continue
+        try:
+            if line in ("/quit", "/q", "/exit"):
+                room.save()
+                return
+            if line == "/new":
+                print(f"  [archived to {room.archive()}]")
+                continue
+            if line in ("/help", "/h", "/?"):
+                print(HELP)
+            elif line == "/status":
+                print(room.status())
+            elif line == "/log":
+                print(room.log_text())
+            elif line.startswith("/note "):
+                room.note(line[6:].strip())
+                print("  [added to log]")
+            elif line.startswith("/ask "):
+                room.ask(line[5:].strip(), quiet)
+            elif line.startswith("/go"):
+                parts = line.split()
+                room.go(int(parts[1]) if len(parts) > 1 else 2, quiet)
+            elif line.startswith("/title"):
+                t = line[6:].strip()
+                if t:
+                    room.set_title(t)
+                else:
+                    print(f"  {room.title}")
+            elif line in ("/persona", "/personalization"):
+                pz = personalization(room.path)
+                print(f"  global  ({GLOBAL_DIR / PERSONA_FILE}):\n    " + (pz["global"].replace("\n", "\n    ") or "(empty)"))
+                print(f"  project ({room.path / PERSONA_FILE}):\n    " + (pz["project"].replace("\n", "\n    ") or "(empty)"))
+            elif line == "/models":
+                print(f"  Claude (default: {claude_default()}): " + ", ".join(m["id"] for m in CLAUDE_MODELS))
+                print("  Codex: asking codex app-server…", flush=True)
+                cm = codex_models()
+                print(f"  Codex (default: {codex_default()}): " + (", ".join(f"{m['id']}" + (" *" if m["is_default"] else "") for m in cm) or "(unavailable)"))
+            elif line.startswith("/effort"):
+                parts = line.split()
+                if len(parts) == 3 and parts[1] in AGENTS:
+                    room.agents[parts[1]].effort = None if parts[2] == "default" else parts[2]
+                    room.save()
+                elif len(parts) != 1:
+                    print("usage: /effort claude|codex <level|default>")
+                for k in AGENTS:
+                    print(f"  {DISPLAY[k]} effort: {room.agents[k].effort or 'default'}")
+            elif line.startswith("/model"):
+                parts = line.split()
+                if len(parts) == 1:
+                    for a in room.agents.values():
+                        print(f"  {a.display}: {a.model or 'default'}")
+                elif len(parts) == 3 and parts[1] in AGENTS:
+                    room.agents[parts[1]].model = None if parts[2] == "default" else parts[2]
+                    room.save()
+                    print(f"  {DISPLAY[parts[1]]} model={room.agents[parts[1]].model or 'default'}")
+                else:
+                    print("usage: /model | /model claude|codex <name|default>")
+            elif line.startswith("/writes"):
+                parts = line.split()
+                if len(parts) != 2 or parts[1] not in ("on", "off"):
+                    print("usage: /writes on|off")
+                else:
+                    room.s["read_only"] = parts[1] == "off"
+                    room.save()
+                    print(f"  writes {parts[1]}")
+            elif line.startswith("/"):
+                print("unknown command; /help")
+            elif line.startswith("@"):
+                target, _, text = line[1:].partition(" ")
+                target = target.lower().rstrip(":,")
+                if target in ("both", "all"):
+                    room.say(text.strip(), list(room.order()), quiet)
+                elif target not in AGENTS or not text.strip():
+                    print("usage: @claude <text> | @codex <text> | @both <text>")
+                else:
+                    room.say(text.strip(), [target], quiet)
+            else:
+                room.say(line, list(room.order()), quiet)
+        except AgentError as e:
+            print(f"\nagent error: {e}", file=sys.stderr)
+            room.save()
+        except KeyboardInterrupt:
+            print("\n  [turn aborted; nothing appended]")
+            room.save()
+
+
+# --------------------------------------------------------------------------- web
+
+def serve(room: Room, port: int, host: str, open_browser: bool = True):
+    import queue
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    jobs: "queue.Queue[tuple]" = queue.Queue()
+    lock = threading.Lock()
+    live = {"busy": None, "since": None, "error": None, "queued": 0}
+    perms: dict = {"pending": {}, "allow_turn": False}   # id -> {tool_name, input, summary, since, decided, allow, message, ev}
+    for a in room.agents.values():
+        a.permission_url = f"http://127.0.0.1:{port}"
+    web = HERE / "web"
+
+    def set_busy(kind):
+        with lock:
+            live["busy"], live["since"] = kind, (time.time() if kind else None)
+
+    # patch the room so the UI can see whose turn it is
+    real_turn = room.turn
+
+    def tracked_turn(kind, instruction, quiet, log_snapshot=None):
+        set_busy(kind)
+        try:
+            return real_turn(kind, instruction, quiet, log_snapshot)
+        finally:
+            set_busy(None)
+            with lock:
+                perms["allow_turn"] = False
+                for pr in perms["pending"].values():
+                    if not pr["decided"]:
+                        pr.update(decided=True, allow=False, message="The turn ended.")
+                        pr["ev"].set()
+                perms["pending"].clear()
+    room.turn = tracked_turn
+
+    def clear_queue():
+        while not jobs.empty():
+            try:
+                jobs.get_nowait()
+                jobs.task_done()
+            except queue.Empty:
+                break
+
+    def interrupt() -> str:
+        """Drop queued work and cut off the running turn. Returns a log tag describing what was cut."""
+        clear_queue()
+        with lock:
+            for pr in perms["pending"].values():
+                if not pr["decided"]:
+                    pr.update(decided=True, allow=False, message="The turn was interrupted.")
+                    pr["ev"].set()
+        with lock:
+            kind = live["busy"]
+            live["interrupted"] = kind
+        if kind:
+            room.agents[kind].abort()
+            return f" (sent now; {DISPLAY[kind]}'s turn was interrupted)"
+        return ""
+
+    def worker():
+        while True:
+            fn, args = jobs.get()
+            with lock:
+                live["queued"] = jobs.qsize()
+                live["error"] = None
+            try:
+                fn(*args)
+            except AgentError as e:
+                with lock:
+                    intentional = live.pop("interrupted", None) is not None and "aborted" in str(e)
+                    live["error"] = None if intentional else str(e)
+                if not intentional:
+                    print(f"agent error: {e}", file=sys.stderr)
+            except Exception as e:  # keep the server alive
+                with lock:
+                    live["error"] = f"{type(e).__name__}: {e}"
+                print(f"error: {e}", file=sys.stderr)
+            finally:
+                room.save()
+                jobs.task_done()
+    threading.Thread(target=worker, daemon=True).start()
+
+    counts_cache: dict = {}
+    catalog = {"claude": {"default": claude_default(), "models": CLAUDE_MODELS, "efforts": CLAUDE_EFFORTS,
+                          "default_effort": claude_settings().get("effortLevel") or "default"},
+               "codex": {"default": codex_default(), "models": [], "loading": True}}
+
+    def load_codex_models():
+        catalog["codex"]["models"] = codex_models()
+        catalog["codex"]["loading"] = False
+    threading.Thread(target=load_codex_models, daemon=True).start()
+
+    def step_counts(turns_dir: Path) -> dict:
+        out = {}
+        if not turns_dir.exists():
+            return out
+        for f in turns_dir.glob("*.events.jsonl"):
+            try:
+                n = int(f.name.split("-")[0])
+                mt = f.stat().st_mtime
+                c = counts_cache.get(f)
+                if not c or c[0] != mt:
+                    c = (mt, sum(1 for line in f.open() if line.strip()))
+                    counts_cache[f] = c
+                out[n] = c[1]
+            except (ValueError, OSError):
+                continue
+        return out
+
+    def events_for(turns_dir: Path, n: int) -> list:
+        for f in turns_dir.glob(f"{n:03d}-*.events.jsonl"):
+            return [json.loads(l) for l in f.open() if l.strip()]
+        return []
+
+    def state() -> dict:
+        with lock:
+            l = dict(live)
+        ents = room.entries()
+        try:
+            ui_version = str(int((web / "index.html").stat().st_mtime))
+        except OSError:
+            ui_version = "0"
+        return {"cwd": room.s["cwd"], "chat": str(room.chat), "n": room.n, "entries": ents, "ui_version": ui_version,
+                "title": room.title,
+                "archives": room.archives(), "steps": step_counts(room.path / "turns"),
+                "live": ([{**e, "text": e["text"][:500]} for e in room.agents[l["busy"]].events[-80:]] if l["busy"] else []),
+                "live_total": (len(room.agents[l["busy"]].events) if l["busy"] else 0),
+                "busy": l["busy"] and DISPLAY[l["busy"]], "busy_since": l["since"], "queued": l["queued"],
+                "error": l["error"], "writes": room.can_write, "commit": room.s["commit"],
+                "first": room.s["first"], "log_tokens": len(room.log_text()) // 4,
+                "models": {k: a.model or "default" for k, a in room.agents.items()},
+                "efforts": {k: a.effort or "default" for k, a in room.agents.items()},
+                "permissions": room.agents["claude"].permissions,
+                "permission": next(({"id": i, "tool_name": p["tool_name"], "summary": p["summary"], "since": p["since"]}
+                                    for i, p in perms["pending"].items() if not p["decided"]), None),
+                "usage": {k: {"turns": a.turns, "in": a.input_tokens, "out": a.output_tokens,
+                              "est_usd": round(a.cost_usd, 2)} for k, a in room.agents.items()}}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):  # quiet
+            pass
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/":
+                self._send(200, (web / "index.html").read_bytes(), "text/html; charset=utf-8")
+            elif path == "/api/state":
+                self._send(200, state())
+            elif path == "/api/models":
+                self._send(200, catalog)
+            elif path == "/api/permission/wait":
+                q = dict(x.split("=", 1) for x in self.path.partition("?")[2].split("&") if "=" in x)
+                pr = perms["pending"].get(q.get("id", ""))
+                if not pr:
+                    return self._send(200, {"decided": True, "allow": False, "message": "unknown request"})
+                pr["ev"].wait(25)
+                self._send(200, {"decided": pr["decided"], "allow": pr["allow"], "message": pr["message"]})
+            elif path == "/api/settings":
+                pz = personalization(room.path)
+                self._send(200, {"global": pz["global"], "project": pz["project"],
+                                 "paths": {"global": str(GLOBAL_DIR / PERSONA_FILE), "project": str(room.path / PERSONA_FILE)},
+                                 "prompts_dir": str(PROMPTS),
+                                 "turn_timeout_min": round(room.agents["claude"].timeout / 60)})
+            elif path.startswith("/api/archive/"):
+                name = path[len("/api/archive/"):]
+                f = room.path / name
+                if not re.fullmatch(r"chat-\d{8}-\d{6}\.md", name) or not f.exists():
+                    return self._send(404, {"error": "no such archive"})
+                stamp = name[len("chat-"):-3]
+                text = f.read_text()
+                self._send(200, {"name": name, "title": title_of(text), "entries": parse_entries(text),
+                                 "steps": step_counts(room.path / f"turns-{stamp}")})
+            elif path.startswith("/api/events/"):
+                q = dict(x.split("=", 1) for x in self.path.partition("?")[2].split("&") if "=" in x)
+                try:
+                    n = int(path[len("/api/events/"):])
+                except ValueError:
+                    return self._send(400, {"error": "bad n"})
+                arch = q.get("archive", "")
+                if arch:
+                    if not re.fullmatch(r"chat-\d{8}-\d{6}\.md", arch):
+                        return self._send(404, {"error": "no such archive"})
+                    tdir = room.path / f"turns-{arch[len('chat-'):-3]}"
+                else:
+                    tdir = room.path / "turns"
+                self._send(200, {"n": n, "events": events_for(tdir, n)})
+            elif path in ("/marked.min.js", "/purify.min.js"):
+                self._send(200, (web / path[1:]).read_bytes(), "application/javascript")
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except json.JSONDecodeError:
+                return self._send(400, {"error": "bad json"})
+            path = self.path.split("?")[0]
+            text = (body.get("text") or "").strip()
+            try:
+                if path == "/api/permission/request":
+                    import threading as _t
+                    rid = f"{int(time.time() * 1000)}-{len(perms['pending'])}"
+                    pr = {"tool_name": body.get("tool_name") or "tool", "input": body.get("input") or {},
+                          "summary": body.get("summary") or "", "since": time.time(),
+                          "decided": False, "allow": False, "message": "", "ev": _t.Event()}
+                    with lock:
+                        if perms["allow_turn"]:
+                            pr.update(decided=True, allow=True)
+                            pr["ev"].set()
+                        perms["pending"][rid] = pr
+                    print(f"  [permission requested: {pr['tool_name']} {pr['summary'][:80]!r}]", flush=True)
+                    return self._send(200, {"id": rid})
+                elif path == "/api/permission/answer":
+                    pr = perms["pending"].get(body.get("id", ""))
+                    if not pr:
+                        return self._send(404, {"error": "no such request"})
+                    with lock:
+                        pr.update(decided=True, allow=bool(body.get("allow")),
+                                  message=(body.get("message") or "The human declined this action."))
+                        if body.get("allow") and body.get("scope") == "turn":
+                            perms["allow_turn"] = True
+                            for other in perms["pending"].values():
+                                if not other["decided"]:
+                                    other.update(decided=True, allow=True)
+                                    other["ev"].set()
+                        pr["ev"].set()
+                elif path == "/api/permissions":
+                    pol = body.get("policy")
+                    if pol not in ("ask", "auto", "off"):
+                        return self._send(400, {"error": "bad policy"})
+                    for a in room.agents.values():
+                        a.permissions = pol
+                    room.save()
+                elif path == "/api/say":
+                    if not text:
+                        return self._send(400, {"error": "empty"})
+                    to = body.get("to", "both")
+                    targets = list(room.order()) if to == "both" else [to]
+                    if any(t not in AGENTS for t in targets):
+                        return self._send(400, {"error": "bad target"})
+                    tag = interrupt() if body.get("now") else ""
+                    jobs.put((room.say, (text, targets, True, tag)))
+                elif path == "/api/ask":
+                    if not text:
+                        return self._send(400, {"error": "empty"})
+                    tag = interrupt() if body.get("now") else ""
+                    jobs.put((room.ask, (text, True, tag)))
+                elif path == "/api/note":
+                    if not text:
+                        return self._send(400, {"error": "empty"})
+                    room.note(text)
+                elif path == "/api/go":
+                    jobs.put((room.go, (max(1, min(int(body.get("n", 2)), 20)), True)))
+                elif path == "/api/abort":
+                    interrupt()
+                elif path == "/api/writes":
+                    room.s["read_only"] = not bool(body.get("on"))
+                    room.save()
+                elif path == "/api/model":
+                    k, name = body.get("agent"), (body.get("name") or "").strip()
+                    if k not in AGENTS:
+                        return self._send(400, {"error": "bad agent"})
+                    room.agents[k].model = None if name in ("", "default") else name
+                    if "effort" in body:
+                        e = (body.get("effort") or "").strip()
+                        room.agents[k].effort = None if e in ("", "default") else e
+                    room.save()
+                elif path == "/api/first":
+                    if body.get("first") in AGENTS:
+                        room.s["first"] = body["first"]
+                        room.save()
+                elif path == "/api/settings":
+                    for scope in ("global", "project"):
+                        if scope in body:
+                            save_personalization(room.path, scope, str(body[scope] or ""))
+                    if "turn_timeout_min" in body:
+                        mins = max(1, min(int(body["turn_timeout_min"] or 120), 24 * 60))
+                        for a in room.agents.values():
+                            a.timeout = mins * 60
+                        room.save()
+                    pz = personalization(room.path)
+                    return self._send(200, {"global": pz["global"], "project": pz["project"]})
+                elif path == "/api/title":
+                    if not text:
+                        return self._send(400, {"error": "empty"})
+                    room.set_title(text)
+                elif path == "/api/new":
+                    if live["busy"]:
+                        return self._send(409, {"error": "busy"})
+                    room.archive()
+                elif path == "/api/edit":
+                    # replace one entry's text (the human editing the log from the UI)
+                    k, new_text = int(body.get("n", 0)), body.get("text") or ""
+                    ents = room.entries()
+                    hit = [e for e in ents if e["n"] == k]
+                    if not hit or live["busy"]:
+                        return self._send(409, {"error": "busy or no such entry"})
+                    old_block = f"\n### [{k}] {hit[0]['who']}{(' ' + hit[0]['addr']) if hit[0]['addr'] else ''}\n\n{hit[0]['text']}\n"
+                    log = room.log_text()
+                    if old_block not in log:
+                        return self._send(409, {"error": "could not locate entry"})
+                    room.chat.write_text(log.replace(old_block, old_block.replace(hit[0]["text"], new_text.strip(), 1), 1))
+                else:
+                    return self._send(404, {"error": "not found"})
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            with lock:
+                live["queued"] = jobs.qsize()
+            self._send(200, state())
+
+    # restart when this script changes on disk, so a patched duet never serves stale code
+    me = Path(__file__).resolve()
+    stamp0 = me.stat().st_mtime
+
+    def watch_self():
+        while True:
+            time.sleep(2)
+            try:
+                if me.stat().st_mtime == stamp0 or live["busy"] or not jobs.empty():
+                    continue
+            except OSError:
+                continue
+            print("duet changed on disk; restarting server", flush=True)
+            room.save()
+            srv.shutdown()
+            return
+    threading.Thread(target=watch_self, daemon=True).start()
+
+    room.ensure_title()
+    srv = ThreadingHTTPServer((host, port), H)
+    url = f"http://{'localhost' if host in ('0.0.0.0', '127.0.0.1') else host}:{port}"
+    print(f"duet web: {url}   room: {room.chat}")
+    if open_browser:
+        import webbrowser
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+        room.save()
+        return
+    room.save()
+    srv.server_close()
+    args = [a for a in sys.argv[1:] if a != "--no-open"] + ["--no-open"]
+    os.execv(sys.executable, [sys.executable, str(me), *args])
+
+
+# --------------------------------------------------------------------------- cli
+
+def main(argv=None):
+    if os.environ.get("DUET_PERMISSION_URL"):
+        return permission_server(os.environ["DUET_PERMISSION_URL"])
+    ap = argparse.ArgumentParser(prog="duet", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cwd", default=".", help="project directory (default: here)")
+    ap.add_argument("--first", choices=AGENTS, default="claude", help="who replies first when both are addressed")
+    ap.add_argument("--read-only", action="store_true", help="analysts may not change files")
+    ap.add_argument("--commit", action="store_true", help="git commit after each analyst turn")
+    ap.add_argument("--claude-model", help="e.g. opus, sonnet, fable")
+    ap.add_argument("--codex-model", help="e.g. gpt-6-astra")
+    ap.add_argument("--claude-allow", nargs="*", default=[], help="extra Claude tool patterns, e.g. 'Bash(pytest:*)'")
+    ap.add_argument("--yolo", action="store_true", help="bypass permission checks and sandboxes")
+    ap.add_argument("--turn-timeout", type=int, default=7200, help="seconds before a single analyst turn is killed (default 7200)")
+    ap.add_argument("--keep-api-keys", action="store_true", help="do NOT strip API key env vars (bills to API)")
+    ap.add_argument("--quiet", action="store_true", help="print headers only, not replies")
+    ap.add_argument("--log", action="store_true", help="print this directory's log and exit")
+    ap.add_argument("--web", action="store_true", help="serve a browser UI for this directory's room instead of the terminal")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--host", default="127.0.0.1", help="bind address for --web (0.0.0.0 to reach it from other devices)")
+    ap.add_argument("--no-open", action="store_true", help="with --web: do not open the browser automatically")
+    args = ap.parse_args(argv)
+
+    cwd = Path(args.cwd).resolve()
+    if not cwd.is_dir():
+        sys.exit(f"not a directory: {cwd}")
+    if args.log:
+        p = cwd / ROOM_DIR / "chat.md"
+        print(p.read_text() if p.exists() else f"no room in {cwd}")
+        return
+    agents = {k: Agent(k, cwd, getattr(args, f"{k}_model"), args.yolo, args.claude_allow if k == "claude" else [],
+                       args.turn_timeout, args.keep_api_keys) for k in AGENTS}
+    room = Room.open(cwd, agents, args.read_only, args.commit, args.first)
+    if args.web:
+        serve(room, args.port, args.host, open_browser=not args.no_open)
+    else:
+        repl(room, args.quiet)
+
+
+if __name__ == "__main__":
+    main()

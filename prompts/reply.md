@@ -1,0 +1,1 @@
+The latest human message is addressed to $addressed. Act on it: do whatever analysis or file work it calls for in the working directory, then write your reply to the room. If it is a question, answer it. If it is a task, do it and report what you did and what you found, including file names.

@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>duet</title>
+<script src="/marked.min.js"></script>
+<script src="/purify.min.js"></script>
+<style>
+  :root {
+    --bg: #faf9f5; --side: #f3f1ea; --card: #ffffff; --bubble: #f0eee6; --ink: #141413; --ink-2: #3d3d3a; --muted: #87867f;
+    --line: #e8e6dc; --line-2: #d9d6ca; --accent: #d97757; --accent-hover: #c46846; --on-accent: #fff;
+    --claude: #d97757; --codex: #2c7a5b; --human: #6a6a65; --code: #f3f1ea; --shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06);
+    --serif: "Tiempos Text", "Iowan Old Style", "Palatino", Georgia, "Times New Roman", serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #262624; --side: #1f1e1d; --card: #30302e; --bubble: #30302e; --ink: #eeece2; --ink-2: #d4d1c4; --muted: #9a978c;
+      --line: #3a3936; --line-2: #4a4945; --accent: #d97757; --accent-hover: #e3906f; --on-accent: #1a1a18;
+      --claude: #e8a080; --codex: #6ac29a; --human: #b5b2a6; --code: #1f1e1d; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 16px/1.6 var(--sans); display: flex; -webkit-font-smoothing: antialiased; }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  input, select { font: inherit; color: var(--ink); }
+
+  /* sidebar */
+  aside { width: 272px; flex: none; background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 14px 10px; gap: 6px; }
+  aside .brand { font-family: var(--serif); font-size: 22px; padding: 6px 10px 10px; letter-spacing: .2px; }
+  aside .brand span { color: var(--accent); }
+  .side-btn { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border-radius: 10px; text-align: left; font-size: 14px; color: var(--ink-2); }
+  .side-btn:hover { background: rgba(0,0,0,.05); }
+  .side-btn.primary { color: var(--accent); font-weight: 600; }
+  .side-btn .plus { width: 24px; height: 24px; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: inline-flex; align-items: center; justify-content: center; font-size: 18px; line-height: 1; }
+  aside h4 { margin: 14px 10px 4px; font-size: 11.5px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; color: var(--muted); }
+  .convs { flex: 1; overflow-y: auto; min-height: 60px; }
+  .conv { display: block; width: 100%; padding: 7px 10px; border-radius: 8px; text-align: left; font-size: 13.5px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .conv:hover { background: rgba(0,0,0,.05); } .conv.on { background: rgba(0,0,0,.07); color: var(--ink); }
+  .conv small { display: block; color: var(--muted); font-size: 11.5px; }
+  .settings { border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--ink-2); }
+  .settings label { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 10px; }
+  .settings input[type=text], .settings select { width: 130px; font-size: 13px; background: var(--card); border: 1px solid var(--line-2); border-radius: 7px; padding: 4px 7px; }
+  .settings .cwd { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .switch { position: relative; width: 34px; height: 20px; appearance: none; background: var(--line-2); border-radius: 20px; cursor: pointer; transition: background .15s; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }
+  .switch:checked { background: var(--accent); } .switch:checked::after { left: 16px; }
+
+  /* main */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .topbar { display: flex; align-items: center; gap: 10px; padding: 12px 24px; font-size: 14px; color: var(--ink-2); }
+  .topbar .title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: text; padding: 2px 6px; margin-left: -6px; border-radius: 6px; }
+  .topbar .title:hover { background: rgba(0,0,0,.05); }
+  .topbar input.title-edit { font: inherit; font-weight: 500; color: var(--ink); background: var(--card); border: 1px solid var(--line-2); border-radius: 6px; padding: 2px 6px; width: min(60vw, 520px); }
+  .topbar .badge { font-size: 11.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 20px; padding: 1px 9px; }
+  .topbar .spacer { flex: 1; }
+  .topbar button { font-size: 13px; color: var(--muted); padding: 4px 10px; border-radius: 8px; } .topbar button:hover { background: rgba(0,0,0,.05); color: var(--ink); }
+  .scroll { flex: 1; overflow-y: auto; }
+  .col { max-width: 760px; margin: 0 auto; padding: 8px 24px 24px; }
+  .empty { text-align: center; padding: 18vh 20px 0; }
+  .empty h1 { font-family: var(--serif); font-weight: 400; font-size: 30px; margin: 0 0 8px; }
+  .empty p { color: var(--muted); margin: 0; }
+
+  .turn { margin: 0 0 26px; }
+  .turn.human { display: flex; justify-content: flex-end; }
+  .turn.human .bubble { background: var(--bubble); border-radius: 18px; padding: 11px 16px; max-width: 86%; white-space: pre-wrap; word-wrap: break-word; }
+  .turn.human .tag { font-size: 11.5px; color: var(--muted); margin: 0 0 4px 2px; }
+  .turn.agent .head { display: flex; align-items: center; gap: 9px; margin-bottom: 6px; }
+  .avatar { width: 26px; height: 26px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; color: #fff; font-size: 12.5px; font-weight: 700; flex: none; }
+  .avatar.claude { background: var(--claude); } .avatar.codex { background: var(--codex); }
+  .turn .name { font-weight: 600; font-size: 14px; }
+  .turn .num { font-size: 12px; color: var(--muted); }
+  .turn.agent .body { padding-left: 35px; }
+  .tools { padding-left: 35px; margin-top: 4px; display: flex; gap: 2px; opacity: 0; transition: opacity .12s; }
+  .turn.human .tools { padding: 0; justify-content: flex-end; }
+  .turn:hover .tools { opacity: 1; }
+  .tools button { color: var(--muted); font-size: 12px; padding: 3px 8px; border-radius: 6px; } .tools button:hover { background: rgba(0,0,0,.06); color: var(--ink); }
+  textarea.editing { width: 100%; min-height: 140px; font: 13.5px/1.5 var(--mono); background: var(--code); color: var(--ink); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px; }
+  .edit-row { display: flex; gap: 8px; margin-top: 8px; }
+  .edit-row button { font-size: 13px; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line-2); }
+  .edit-row button.save { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+
+  /* prose */
+  .body > :first-child { margin-top: 0; } .body > :last-child { margin-bottom: 0; }
+  .body p { margin: 0 0 12px; }
+  .body h1, .body h2, .body h3, .body h4 { font-weight: 600; margin: 20px 0 8px; line-height: 1.3; }
+  .body h1 { font-size: 20px; } .body h2 { font-size: 18px; } .body h3 { font-size: 16px; } .body h4 { font-size: 15px; }
+  .body ul, .body ol { margin: 0 0 12px; padding-left: 24px; } .body li { margin: 3px 0; } .body li > p { margin: 0; }
+  .body strong { font-weight: 600; }
+  .body a { color: var(--accent); }
+  .body code { font: 13.5px var(--mono); background: var(--code); border: 1px solid var(--line); padding: 1px 5px; border-radius: 5px; }
+  .body pre { background: var(--code); border: 1px solid var(--line); padding: 12px 14px; border-radius: 10px; overflow-x: auto; margin: 0 0 12px; }
+  .body pre code { background: none; border: none; padding: 0; font-size: 13px; }
+  .body blockquote { border-left: 3px solid var(--line-2); margin: 0 0 12px; padding: 2px 14px; color: var(--ink-2); }
+  .body hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
+  .body .tbl { overflow-x: auto; margin: 0 0 14px; border: 1px solid var(--line); border-radius: 10px; }
+  .body table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  .body th, .body td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .body th { background: var(--code); font-weight: 600; }
+  .body tr:last-child td { border-bottom: none; }
+  .body td:not(:first-child), .body th:not(:first-child) { border-left: 1px solid var(--line); }
+
+  /* working */
+  .working .body { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 14px; min-height: 24px; }
+  .dots { display: inline-flex; align-items: center; gap: 4px; height: 24px; }
+  .dots i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: b 1.2s infinite ease-in-out; }
+  .dots i:nth-child(2) { animation-delay: .15s; } .dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes b { 0%, 80%, 100% { transform: translateY(0); opacity: .35; } 40% { transform: translateY(-3px); opacity: 1; } }
+  .working .abort { color: var(--muted); font-size: 13px; text-decoration: underline; padding: 0; line-height: 1; } .working .abort:hover { color: var(--ink); }
+  .working .elapsed { color: var(--muted); font-weight: 400; }
+  .error { color: #b03a2e; font-size: 14px; margin: 0 0 20px; }
+  .readonly-note { text-align: center; color: var(--muted); font-size: 13px; padding: 10px; }
+
+  /* permission card */
+  .perm { max-width: 760px; margin: 0 auto 8px; padding: 12px 16px; background: var(--card); border: 1px solid var(--accent); border-radius: 12px; box-shadow: var(--shadow); font-size: 14px; }
+  .perm .perm-head { margin-bottom: 8px; } .perm .muted { color: var(--muted); font-size: 12.5px; }
+  .perm pre { margin: 0 0 10px; font: 12.5px/1.45 var(--mono); background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+  .perm .perm-row { display: flex; gap: 8px; }
+  .perm .perm-row button { font-size: 13.5px; padding: 6px 14px; border-radius: 20px; border: 1px solid var(--line-2); }
+  .perm .allow { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+  .perm .allow-turn { color: var(--accent); border-color: var(--accent); }
+  .perm .deny { color: var(--ink-2); }
+  /* status strip while an analyst works */
+  .strip { max-width: 760px; margin: 0 auto 8px; padding: 7px 14px; display: flex; align-items: center; gap: 10px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); font-size: 13px; color: var(--ink-2); }
+  .strip .strip-main { flex: none; white-space: nowrap; }
+  .strip .strip-last { flex: 1; min-width: 0; font: 12px var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: none; border: none; padding: 0; }
+  .strip .strip-jump { flex: none; font-size: 12.5px; color: var(--accent); padding: 2px 6px; border-radius: 6px; } .strip .strip-jump:hover { background: rgba(0,0,0,.05); }
+  /* composer */
+  .composer-wrap { padding: 0 24px 18px; }
+  .composer { max-width: 760px; margin: 0 auto; background: var(--card); border: 1px solid var(--line); border-radius: 20px; box-shadow: var(--shadow); padding: 12px 14px 10px; }
+  .composer textarea { width: 100%; border: none; outline: none; resize: none; background: transparent; color: var(--ink); font: 16px/1.5 var(--sans); min-height: 28px; max-height: 40vh; padding: 2px 4px 8px; }
+  .composer textarea::placeholder { color: var(--muted); }
+  .bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .chip { font-size: 13px; color: var(--ink-2); padding: 5px 11px; border-radius: 20px; border: 1px solid transparent; }
+  .chip:hover { background: rgba(0,0,0,.05); }
+  .chip.on { background: var(--bubble); border-color: var(--line-2); color: var(--ink); font-weight: 500; }
+  .chip.on.claude { color: var(--claude); } .chip.on.codex { color: var(--codex); }
+  .bar .spacer { flex: 1; }
+  .go { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); }
+  .go button { color: var(--ink-2); padding: 5px 9px; border-radius: 20px; } .go button:hover { background: rgba(0,0,0,.05); }
+  .go input { width: 38px; text-align: center; font-size: 13px; background: transparent; border: 1px solid var(--line-2); border-radius: 7px; padding: 2px 4px; }
+  .now { font-size: 13px; color: var(--accent); border: 1px solid var(--accent); border-radius: 20px; padding: 5px 11px; }
+  .now:hover { background: var(--accent); color: var(--on-accent); }
+  .send { width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: inline-flex; align-items: center; justify-content: center; transition: background .12s; }
+  .send:hover { background: var(--accent-hover); }
+  .send svg { width: 16px; height: 16px; }
+  .foot { text-align: center; color: var(--muted); font-size: 11.5px; padding-top: 10px; }
+
+  .wt { color: var(--muted); font-size: 12.5px; padding: 4px 0; margin: 6px 0 0 35px; }
+  .wt:hover { color: var(--ink); }
+  .work { margin: 6px 0 0 35px; border-left: 2px solid var(--line); padding: 2px 0 2px 14px; font-size: 13px; color: var(--ink-2); display: flex; flex-direction: column; gap: 6px; }
+  .st { line-height: 1.45; }
+  .st.think { color: var(--muted); font-style: italic; white-space: pre-wrap; }
+  .st.tool { display: flex; gap: 8px; align-items: baseline; }
+  .st.tool b { flex: none; font-size: 11px; font-weight: 600; letter-spacing: .3px; text-transform: uppercase; color: var(--muted); min-width: 44px; }
+  .st.tool code { font: 12.5px var(--mono); background: var(--code); border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; white-space: pre-wrap; word-break: break-all; }
+  .st.out summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .st.out.err summary { color: #b03a2e; }
+  .st.out pre { margin: 4px 0 0; font: 12px/1.45 var(--mono); background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; max-height: 320px; overflow: auto; white-space: pre-wrap; }
+  .st.text .body { font-size: 13.5px; }
+  .st.sub { margin-left: 18px; opacity: .8; }
+  .settings-view h2 { font-family: var(--serif); font-weight: 400; font-size: 26px; margin: 18px 0 4px; }
+  .settings-view h3 { font-size: 15px; font-weight: 600; margin: 26px 0 4px; }
+  .settings-view .help { color: var(--muted); font-size: 13.5px; margin: 0 0 8px; }
+  .settings-view .help code { font: 12px var(--mono); background: var(--code); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+  .settings-view textarea { width: 100%; font: 14.5px/1.5 var(--sans); color: var(--ink); background: var(--card); border: 1px solid var(--line-2); border-radius: 12px; padding: 12px 14px; resize: vertical; }
+  .settings-view textarea:focus { outline: none; border-color: var(--muted); }
+  .settings-view .edit-row { align-items: center; margin-top: 12px; }
+  @media (max-width: 820px) { aside { display: none; } }
+</style>
+</head>
+<body>
+<aside>
+  <div class="brand">du<span>e</span>t</div>
+  <button class="side-btn primary" id="new"><span class="plus">+</span><span id="new-label">New conversation</span></button>
+  <button class="side-btn" id="show-current" hidden>← Back to conversation</button>
+  <button class="side-btn" id="open-settings">⚙︎ Settings</button>
+  <h4>Conversations</h4>
+  <div class="convs" id="convs"></div>
+  <div class="settings">
+    <div class="cwd" id="cwd" title=""></div>
+    <label>Claude model <select id="m-claude"></select></label>
+    <label id="c-claude-row" hidden><span></span><input type="text" id="c-claude" placeholder="model id"></label>
+    <label>Claude effort <select id="e-claude"></select></label>
+    <label>Codex model <select id="m-codex"></select></label>
+    <label id="c-codex-row" hidden><span></span><input type="text" id="c-codex" placeholder="model id"></label>
+    <label>Codex effort <select id="e-codex"></select></label>
+    <label>Replies first <select id="first"><option value="claude">Claude</option><option value="codex">Codex</option></select></label>
+    <label>May edit files <input type="checkbox" class="switch" id="writes"></label>
+  </div>
+</aside>
+
+<div class="main">
+  <div class="topbar">
+    <span class="title" id="title" title="click to rename"></span>
+    <span class="badge" id="badge"></span>
+    <span class="spacer"></span>
+    <button id="usage" title="turns and token use"></button>
+  </div>
+  <div class="scroll" id="scroll">
+    <div class="col" id="col"></div>
+    <div class="col settings-view" id="settings" hidden>
+      <h2>Personalization</h2>
+      <p class="help">Standing instructions for both analysts. They are added to every prompt, after the built-in framing, and take precedence over it. Edits apply from the next turn.</p>
+      <h3>Everywhere</h3>
+      <p class="help">Applies in every room on this machine. <code id="p-global-path"></code></p>
+      <textarea id="p-global" rows="10" placeholder="e.g. Treat me as an expert. Give numbers with ranges. Cite sources. Never flatter."></textarea>
+      <h3>This project</h3>
+      <p class="help">Applies only in this directory. <code id="p-project-path"></code></p>
+      <textarea id="p-project" rows="8" placeholder="e.g. All figures in USD millions. The board deck is the deliverable; model.xlsx is the source of truth."></textarea>
+      <div class="edit-row"><button class="save" id="p-save">Save</button><span class="help" id="p-status"></span></div>
+      <h3>Permissions</h3>
+      <p class="help">What happens when Claude wants to do something its permission layer would normally ask about, such as a bulk move or a command outside the project.</p>
+      <select id="p-perms" style="font:inherit;padding:5px 8px;border:1px solid var(--line-2);border-radius:7px;background:var(--card);color:var(--ink)">
+        <option value="ask">Ask me (a card appears here with Allow and Deny)</option>
+        <option value="auto">Decide automatically (safe actions allowed, the rest denied)</option>
+        <option value="off">No checks (Claude runs anything, like Codex inside its sandbox, but with no sandbox)</option>
+      </select>
+      <h3>Turn limit</h3>
+      <p class="help">An analyst turn is cut off after this many minutes. Long research turns can take a while; the Abort button is always there.</p>
+      <label class="help" style="display:flex;align-items:center;gap:8px"><input type="number" id="p-timeout" min="1" max="1440" style="width:90px;font:inherit;padding:4px 8px;border:1px solid var(--line-2);border-radius:7px;background:var(--card);color:var(--ink)"> minutes</label>
+      <h3>Advanced</h3>
+      <p class="help">The built-in framing and per-turn instructions are plain text templates in <code id="p-prompts"></code>. Edit them there.</p>
+    </div>
+  </div>
+  <div class="perm" id="perm" hidden>
+    <div class="perm-head"><b id="perm-who">Claude</b> asks permission · <span id="perm-tool"></span> · <span class="muted" id="perm-since"></span></div>
+    <pre id="perm-summary"></pre>
+    <div class="perm-row"><button class="allow" onclick="answerPerm(true, 'once')">Allow</button><button class="allow-turn" onclick="answerPerm(true, 'turn')">Allow everything this turn</button><button class="deny" onclick="answerPerm(false)">Deny</button></div>
+  </div>
+  <div class="strip" id="strip" hidden>
+    <span class="dots"><i></i><i></i><i></i></span>
+    <span class="strip-main"><b id="strip-who"></b> <span id="strip-meta"></span></span>
+    <code class="strip-last" id="strip-last"></code>
+    <button class="strip-jump" id="strip-jump">jump to live ↓</button>
+    <button class="strip-jump" onclick="api('/api/abort')">abort</button>
+  </div>
+  <div class="composer-wrap" id="composer-wrap">
+    <div class="composer">
+      <textarea id="text" rows="1" placeholder="Message both analysts…"></textarea>
+      <div class="bar">
+        <span id="target">
+          <button class="chip on" data-to="both">Both</button>
+          <button class="chip claude" data-to="claude">Claude</button>
+          <button class="chip codex" data-to="codex">Codex</button>
+          <button class="chip" data-to="ask" title="both answer blind, without seeing each other's answer">Ask blind</button>
+          <button class="chip" data-to="note" title="add to the log, no reply">Note</button>
+        </span>
+        <span class="spacer"></span>
+        <span class="go"><button id="go" title="let the two analysts work with each other">Let them work</button><input type="text" id="go-n" value="2"><span>turns</span></span>
+        <button class="now" id="now" hidden title="Interrupt the current turn and deliver this immediately (⌘Enter)">Send now</button>
+        <button class="send" id="send" title="Send (Enter). While an analyst is working, this queues."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+      </div>
+    </div>
+    <div class="foot">Both analysts see the whole conversation. Claude runs on your claude.ai login, Codex on your ChatGPT login.</div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const col = $('#col'), scroll = $('#scroll');
+let target = 'both', lastKey = '', editing = null, state = null, viewing = null; // viewing = archive name or null
+marked.setOptions({ gfm: true, breaks: false });
+function md(t) { return DOMPurify.sanitize(marked.parse(t || '')).replace(/<table>/g, '<div class="tbl"><table>').replace(/<\/table>/g, '</table></div>'); }
+function esc(t) { return (t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+function since(t) { const s = Math.max(0, Math.round(Date.now() / 1000 - t)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`; }
+
+function stepsHTML(evs) {
+  let h = '';
+  for (const ev of evs || []) {
+    const t = ev.text || '';
+    const sub = ev.sub ? ' sub' : '';
+    if (ev.k === 'think') h += `<div class="st think${sub}">${esc(t)}</div>`;
+    else if (ev.k === 'tool') h += `<div class="st tool${sub}"><b>${ev.sub ? 'sub · ' : ''}${esc(ev.name || 'tool')}</b><code>${esc(t)}</code></div>`;
+    else if (ev.k === 'out' && t.trim()) h += `<details class="st out${sub} ${ev.name === 'error' ? 'err' : ''}"><summary>${ev.name === 'error' ? 'error' : 'output'} · ${t.length.toLocaleString()} chars</summary><pre>${esc(t)}</pre></details>`;
+    else if (ev.k === 'text') h += `<div class="st text"><div class="body">${md(t)}</div></div>`;
+  }
+  return h;
+}
+const openWork = new Set(), workCache = {};
+async function toggleWork(n, archive) {
+  const key = archive + '#' + n, panel = document.getElementById('work-' + n), btn = document.getElementById('wt-' + n);
+  if (openWork.has(key)) { openWork.delete(key); panel.hidden = true; btn.textContent = btn.textContent.replace('Hide', 'Show'); return; }
+  openWork.add(key);
+  if (!workCache[key]) { const r = await fetch('/api/events/' + n + (archive ? '?archive=' + archive : '')); workCache[key] = (await r.json()).events || []; }
+  panel.innerHTML = stepsHTML(workCache[key]); panel.hidden = false; btn.textContent = btn.textContent.replace('Show', 'Hide');
+}
+function workHTML(e, steps, archive) {
+  const n = (steps || {})[e.n]; if (!n) return '';
+  const key = archive + '#' + e.n, open = openWork.has(key);
+  return `<button class="wt" id="wt-${e.n}" onclick="toggleWork(${e.n}, '${archive}')">${open ? 'Hide' : 'Show'} work · ${n} step${n === 1 ? '' : 's'}</button><div class="work" id="work-${e.n}" ${open ? '' : 'hidden'}>${open ? stepsHTML(workCache[key]) : ''}</div>`;
+}
+function entryHTML(e, editable, steps, archive) {
+  const who = e.who.toLowerCase();
+  if (who === 'human') {
+    const tag = e.addr ? `<div class="tag">${esc(e.addr)}</div>` : '';
+    const body = editing === e.n ? editor(e) : `<div class="bubble">${esc(e.text)}</div>`;
+    const tools = editable ? `<div class="tools"><button onclick="startEdit(${e.n})">edit</button></div>` : '';
+    return `<div class="turn human"><div style="max-width:86%">${tag}${body}${tools}</div></div>`;
+  }
+  const body = editing === e.n ? editor(e) : `<div class="body">${md(e.text)}</div>`;
+  const tools = editable ? `<div class="tools"><button onclick="startEdit(${e.n})">edit</button><button onclick="copyText(${e.n})">copy</button></div>` : '';
+  return `<div class="turn agent"><div class="head"><span class="avatar ${who}">${who === 'claude' ? 'C' : 'X'}</span><span class="name">${e.who}</span><span class="num">#${e.n}</span></div>${body}${workHTML(e, steps, archive || '')}${tools}</div>`;
+}
+function editor(e) {
+  return `<textarea class="editing" id="edit-${e.n}">${esc(e.text)}</textarea>
+          <div class="edit-row"><button class="save" onclick="saveEdit(${e.n})">Save</button><button onclick="editing=null;lastKey='';draw(state)">Cancel</button></div>`;
+}
+function startEdit(n) { editing = n; lastKey = ''; draw(state); }
+async function saveEdit(n) { const text = $('#edit-' + n).value; editing = null; lastKey = ''; await api('/api/edit', { n, text }); }
+function copyText(n) { const e = state.entries.find(x => x.n === n); if (e) navigator.clipboard?.writeText(e.text); }
+
+function elapsedText(st) { return `${since(st.busy_since)}${st.queued ? ` · ${st.queued} queued` : ''}`; }
+function workingHTML(st) {
+  const who = st.busy.toLowerCase();
+  return `<div class="turn agent working"><div class="head"><span class="avatar ${who}">${who === 'claude' ? 'C' : 'X'}</span><span class="name">${st.busy}</span><span class="num">is working · <span class="elapsed">${elapsedText(st)}</span></span></div>
+          <div class="work" id="live-work">${st.live_total > (st.live || []).length ? `<div class="st think">… ${st.live_total - st.live.length} earlier steps; full detail under Show work when the turn ends</div>` : ''}${stepsHTML(st.live)}</div></div>`;
+}
+let liveN = -1;
+function draw(st) {
+  if (viewing || inSettings) { drawConvs(st); return; }
+  const key = ['live', st.n, st.entries.map(e => e.n + ':' + e.text.length + ':' + ((st.steps || {})[e.n] || 0)).join(','), editing, st.busy, st.error].join('|');
+  const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120;
+  if (key !== lastKey) {
+    lastKey = key;
+    let html = '';
+    if (!st.entries.length) html = `<div class="empty"><h1>Two analysts, one conversation.</h1><p>Whatever you send first is the brief. Both will answer it.</p></div>`;
+    for (const e of st.entries) html += entryHTML(e, true, st.steps, '');
+    if (st.busy) { html += workingHTML(st); liveN = (st.live || []).length; }
+    if (st.error) html += `<div class="error">${esc(st.error)}</div>`;
+    col.innerHTML = html;
+    if (atBottom) scroll.scrollTop = scroll.scrollHeight;
+  } else if (st.busy) {
+    const w = col.querySelector('.working .elapsed');
+    if (w) w.textContent = elapsedText(st);
+    const lw = document.getElementById('live-work');
+    if (lw && (st.live || []).length !== liveN) { liveN = st.live.length; lw.innerHTML = stepsHTML(st.live); if (atBottom) scroll.scrollTop = scroll.scrollHeight; }
+  }
+  $('#title').textContent = st.title;
+  $('#badge').textContent = `${st.entries.length} entries · ≈${st.log_tokens.toLocaleString()} tokens`;
+  $('#cwd').textContent = st.cwd; $('#cwd').title = st.cwd;
+  const u = st.usage;
+  $('#usage').textContent = `Claude ${u.claude.turns} · Codex ${u.codex.turns}`;
+  $('#usage').title = `Claude: ${u.claude.in.toLocaleString()} in / ${u.claude.out.toLocaleString()} out (≈$${u.claude.est_usd} list, subscription)\nCodex: ${u.codex.in.toLocaleString()} in / ${u.codex.out.toLocaleString()} out`;
+  syncModels(st);
+  if (document.activeElement !== $('#first')) $('#first').value = st.first;
+  $('#writes').checked = st.writes;
+  $('#new').disabled = !!st.busy;
+  const perm = $('#perm'), pr = st.permission;
+  if (pr && !viewing && !inSettings) {
+    if (perm.dataset.id !== pr.id) { perm.dataset.id = pr.id; $('#perm-tool').textContent = pr.tool_name; $('#perm-summary').textContent = pr.summary || JSON.stringify(pr.input || {}); $('#perm-who').textContent = st.busy || 'Claude'; }
+    $('#perm-since').textContent = 'waiting ' + since(pr.since);
+    perm.hidden = false;
+  } else { perm.hidden = true; delete perm.dataset.id; }
+  const strip = $('#strip');
+  if (st.busy && !viewing && !inSettings) {
+    strip.hidden = false;
+    $('#strip-who').textContent = st.busy;
+    $('#strip-meta').textContent = `working · ${since(st.busy_since)} · ${(st.live_total || (st.live || []).length).toLocaleString()} steps${st.queued ? ` · ${st.queued} queued` : ''}`;
+    const last = (st.live || []).slice().reverse().find(e => e.k === 'tool' || e.k === 'think');
+    $('#strip-last').textContent = last ? `${last.sub ? 'sub · ' : ''}${last.name || last.k}: ${(last.text || '').split('\n')[0].slice(0, 160)}` : '';
+    const w = col.querySelector('.working');
+    $('#strip-jump').hidden = !w || (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 160);
+  } else strip.hidden = true;
+  $('#now').hidden = !st.busy || target === 'note';
+  $('#send').title = st.busy ? 'Queue (Enter): delivered after the current work finishes' : 'Send (Enter)';
+  drawConvs(st);
+}
+function drawConvs(st) {
+  const c = $('#convs');
+  let html = `<button class="conv ${viewing ? '' : 'on'}" onclick="showCurrent()">${esc(st.title)}<small>current · ${st.entries.length} entries</small></button>`;
+  for (const a of st.archives) html += `<button class="conv ${viewing === a.name ? 'on' : ''}" onclick="showArchive('${a.name}')">${esc(a.title)}<small>${a.when.replace('T', ' ')} · ${a.entries} entries</small></button>`;
+  if (c.innerHTML !== html) c.innerHTML = html;
+}
+async function showArchive(name) {
+  const r = await fetch('/api/archive/' + name); const j = await r.json();
+  viewing = name;
+  col.innerHTML = `<div class="readonly-note">Archived conversation ${name}. Read only.</div>` + j.entries.map(e => entryHTML(e, false, j.steps, name)).join('');
+  $('#composer-wrap').hidden = true; $('#show-current').hidden = false; $('#title').textContent = j.title || (j.entries.find(e => e.who === 'Human') || { text: name }).text.split('\n')[0].slice(0, 80);
+  scroll.scrollTop = 0; drawConvs(state);
+}
+let inSettings = false, settingsDirty = false;
+async function openSettings() {
+  inSettings = true; viewing = null;
+  const j = await (await fetch('/api/settings')).json();
+  $('#p-global').value = j.global; $('#p-project').value = j.project; $('#p-timeout').value = j.turn_timeout_min; $('#p-perms').value = (state && state.permissions) || 'ask';
+  $('#p-global-path').textContent = j.paths.global; $('#p-project-path').textContent = j.paths.project; $('#p-prompts').textContent = j.prompts_dir;
+  $('#p-status').textContent = ''; settingsDirty = false;
+  $('#col').hidden = true; $('#composer-wrap').hidden = true; $('#settings').hidden = false; $('#show-current').hidden = false;
+  $('#title').textContent = 'Settings'; $('#badge').textContent = ''; scroll.scrollTop = 0; drawConvs(state);
+}
+async function saveSettings() {
+  const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ global: $('#p-global').value, project: $('#p-project').value, turn_timeout_min: parseInt($('#p-timeout').value) || 120 }) });
+  $('#p-status').textContent = r.ok ? 'Saved. Applies from the next turn.' : 'Save failed.'; settingsDirty = false;
+}
+$('#open-settings').onclick = openSettings;
+$('#strip-jump').onclick = () => { scroll.scrollTop = scroll.scrollHeight; };
+async function answerPerm(allow, scope) { const id = $('#perm').dataset.id; if (!id) return; $('#perm').hidden = true; await api('/api/permission/answer', { id, allow, scope: scope || 'once' }); }
+$('#title').addEventListener('click', () => {
+  if (viewing || inSettings) return;
+  const span = $('#title'), inp = document.createElement('input');
+  inp.className = 'title-edit'; inp.value = state ? state.title : span.textContent;
+  span.replaceWith(inp); inp.focus(); inp.select();
+  const done = async (save) => {
+    const v = inp.value.trim();
+    inp.replaceWith(span);
+    if (save && v && v !== state.title) await api('/api/title', { text: v });
+  };
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') done(true); if (e.key === 'Escape') done(false); });
+  inp.addEventListener('blur', () => done(true));
+});
+$('#p-save').onclick = saveSettings;
+$('#p-perms').addEventListener('change', e => api('/api/permissions', { policy: e.target.value }).then(() => { $('#p-status').textContent = 'Permissions: ' + e.target.value + '. Applies from the next turn.'; }));
+for (const id of ['#p-global', '#p-project', '#p-timeout']) $(id).addEventListener('input', () => { settingsDirty = true; $('#p-status').textContent = 'Unsaved changes'; });
+function showCurrent() { inSettings = false; $('#settings').hidden = true; $('#col').hidden = false; viewing = null; lastKey = ''; $('#composer-wrap').hidden = false; $('#show-current').hidden = true; draw(state); }
+
+async function api(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const j = await r.json();
+  if (!r.ok) { col.insertAdjacentHTML('beforeend', `<div class="error">${esc(j.error || String(r.status))}</div>`); return null; }
+  state = j; draw(j); return j;
+}
+let uiVersion = null;
+async function poll() {
+  try {
+    const r = await fetch('/api/state'); state = await r.json();
+    if (uiVersion === null) uiVersion = state.ui_version;
+    else if (state.ui_version && state.ui_version !== uiVersion && !$('#text').value.trim() && editing === null && !settingsDirty) { location.reload(); return; }
+    draw(state);
+  } catch (e) {}
+  setTimeout(poll, state && state.permission ? 700 : state && state.busy ? 1200 : 2500);
+}
+async function send(now) {
+  const ta = $('#text'); const text = ta.value.trim();
+  if (!text) return;
+  ta.value = ''; ta.style.height = 'auto';
+  if (viewing || inSettings) showCurrent();
+  if (target === 'ask') await api('/api/ask', { text, now: !!now });
+  else if (target === 'note') await api('/api/note', { text });
+  else await api('/api/say', { text, to: target, now: !!now });
+  scroll.scrollTop = scroll.scrollHeight;
+}
+const ta = $('#text');
+ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, window.innerHeight * .4) + 'px'; });
+ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(e.metaKey || e.ctrlKey); } });
+$('#send').onclick = () => send(false);
+$('#now').onclick = () => send(true);
+$('#target').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  target = b.dataset.to;
+  for (const x of $('#target').children) x.classList.toggle('on', x === b);
+  ta.placeholder = { both: 'Message both analysts…', claude: 'Message Claude…', codex: 'Message Codex…',
+    ask: 'Ask both, answered blind…', note: 'Add a note to the conversation (no reply)…' }[target];
+  ta.focus();
+});
+$('#go').onclick = () => api('/api/go', { n: parseInt($('#go-n').value) || 2 });
+$('#writes').onchange = e => api('/api/writes', { on: e.target.checked });
+$('#first').onchange = e => api('/api/first', { first: e.target.value });
+let catalog = null;
+function fill(sel, items, current, label) {
+  let h = `<option value="default">Default (${esc(label)})</option>`;
+  for (const m of items) h += `<option value="${esc(m.id)}">${esc(m.name)}${m.desc ? ' · ' + esc(m.desc) : ''}</option>`;
+  sel.innerHTML = h + '<option value="__custom">Custom…</option>';
+  const known = current === 'default' || items.some(m => m.id === current);
+  sel.value = known ? current : '__custom';
+  return known;
+}
+function syncModels(st) {
+  if (!catalog) return;
+  for (const k of ['claude', 'codex']) {
+    const sel = $('#m-' + k), row = $('#c-' + k + '-row'), inp = $('#c-' + k);
+    if (document.activeElement === sel || document.activeElement === inp) continue;
+    const c = catalog[k] || { models: [], default: 'default' }, known = fill(sel, c.models || [], st.models[k], c.default + (c.loading ? ', loading list…' : ''));
+    row.hidden = known; if (!known) inp.value = st.models[k];
+  }
+  const ec = $('#e-codex');
+  if (document.activeElement !== ec) {
+    const m = catalog.codex.models.find(x => x.id === st.models.codex) || catalog.codex.models.find(x => x.is_default) || { efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] };
+    ec.innerHTML = `<option value="default">Default${m.default_effort ? ' (' + m.default_effort + ')' : ''}</option>` + m.efforts.map(e => `<option value="${e}">${e}</option>`).join('');
+    ec.value = (st.efforts || {}).codex || 'default';
+  }
+  const ea = $('#e-claude');
+  if (document.activeElement !== ea) {
+    ea.innerHTML = `<option value="default">Default (${esc(catalog.claude.default_effort || 'default')})</option>` + (catalog.claude.efforts || ['low', 'medium', 'high', 'xhigh', 'max']).map(e => `<option value="${e}">${e}</option>`).join('');
+    ea.value = (st.efforts || {}).claude || 'default';
+  }
+}
+async function loadCatalog() {
+  try { catalog = await (await fetch('/api/models')).json(); if (state) syncModels(state); if (catalog.codex.loading) setTimeout(loadCatalog, 2000); }
+  catch (e) { setTimeout(loadCatalog, 3000); }
+}
+function setModel(k, name) { api('/api/model', { agent: k, name, effort: $('#e-' + k).value }); }
+for (const k of ['claude', 'codex']) {
+  $('#m-' + k).addEventListener('change', e => {
+    const v = e.target.value;
+    if (v === '__custom') { $('#c-' + k + '-row').hidden = false; $('#c-' + k).focus(); return; }
+    $('#c-' + k + '-row').hidden = true; setModel(k, v === 'default' ? '' : v);
+  });
+  $('#c-' + k).addEventListener('change', e => setModel(k, e.target.value.trim()));
+}
+for (const k of ['claude', 'codex']) $('#e-' + k).addEventListener('change', () => setModel(k, state.models[k] === 'default' ? '' : state.models[k]));
+loadCatalog();
+$('#show-current').onclick = showCurrent;
+$('#new').onclick = () => {
+  const b = $('#new'), l = $('#new-label');
+  if (b.dataset.arm) { delete b.dataset.arm; l.textContent = 'New conversation'; api('/api/new').then(() => showCurrent()); return; }
+  if (!state || !state.entries.length) { ta.focus(); return; }
+  b.dataset.arm = '1'; l.textContent = 'Click again to confirm';
+  setTimeout(() => { delete b.dataset.arm; l.textContent = 'New conversation'; }, 4000);
+};
+poll();
+</script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+The human has asked a question and wants independent answers: $other is answering the same question from the same log, and neither of you will see the other's answer until both are in. Give your own answer, with your reasoning and your assumptions, and a number or range if the question calls for one. Do not hedge toward what you think $other might say.
