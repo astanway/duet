@@ -1,6 +1,6 @@
 # duet room
 
-working directory: `/private/tmp/claude-501/-Users-astanway-code-ai-chat/666478c7-94aa-475d-8b07-e1a96a081637/scratchpad/saas`
+working directory: `~/models/saas-memo`
 
 ### [1] Human
 
